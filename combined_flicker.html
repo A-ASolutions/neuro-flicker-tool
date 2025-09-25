@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Neuro Flicker – Dual Mode (Adaptive 40↔30 Hz)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: black;
+      color: white;
+      font-family: sans-serif;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+
+    #controls {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(0,0,0,0.7);
+      padding: 20px;
+      border-radius: 10px;
+      z-index: 10;
+      font-size: 16px;
+      line-height: 1.6;
+      max-width: 320px;
+    }
+    #timerDisplay { margin-top: 10px; font-weight: bold; }
+    #infoLine { margin-top: 6px; font-size: 14px; opacity: .9; }
+    #branding {
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      font-size: 12px;
+      color: white;
+      background: rgba(0,0,0,0.5);
+      padding: 6px 10px;
+      border-radius: 6px;
+      z-index: 10;
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <label><input type="radio" name="mode" value="clinical" checked> Clinical Mode</label><br>
+    <label><input type="radio" name="mode" value="safe"> Safe Mode</label><br>
+    <label>Brightness (safe mode): <input type="range" id="brightness" min="0" max="255" value="136"></label><br>
+    <label>Duration (minutes): <input type="number" id="duration" min="1" max="30" value="4"></label><br>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn">Stop</button>
+    <div id="timerDisplay">Remaining: 00:00</div>
+    <div id="infoLine">Detecting refresh…</div>
+  </div>
+
+  <div id="branding">Designed by Meaningful Path Therapy (Abdullah Al-Shoaibi)</div>
+  <canvas id="flickerCanvas"></canvas>
+
+  <script>
+    const canvas = document.getElementById("flickerCanvas");
+    const ctx = canvas.getContext("2d");
+    const brightnessSlider = document.getElementById("brightness");
+    const durationInput = document.getElementById("duration");
+    const timerDisplay = document.getElementById("timerDisplay");
+    const infoLine = document.getElementById("infoLine");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn  = document.getElementById("stopBtn");
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas, { passive: true });
+    resizeCanvas();
+
+    function getSelectedMode() {
+      return document.querySelector('input[name="mode"]:checked').value;
+    }
+
+    // --- Flicker state ---
+    let animationId = null;
+    let endTime = 0;
+    let state = false;
+
+    // Adaptive parameters
+    let approxHz = 60;         // measured/rounded refresh
+    let targetHz = 40;         // 40 by default, 30 if approxHz === 60
+    let useFrameToggle = false; // true for exact 30 Hz on 60 Hz (toggle each frame)
+    let lastToggleTs = 0;       // in ms (rAF timestamp)
+    let toggleIntervalMs = 12.5; // half-period for square wave; will update per targetHz
+
+    // --- Refresh-rate detection (median of rAF deltas) ---
+    (function detectRefresh(){
+      const samples = [];
+      let last = performance.now();
+
+      function tick(now){
+        samples.push(now - last);
+        last = now;
+        if (samples.length < 100) {
+          requestAnimationFrame(tick);
+        } else {
+          samples.shift(); // drop first
+          const sorted = samples.slice().sort((a,b)=>a-b);
+          const median = sorted[Math.floor(sorted.length/2)];
+          const estHz = 1000 / median;
+
+          const candidates = [50, 60, 75, 90, 100, 120, 144, 165, 180, 200, 240];
+          approxHz = candidates.reduce((best, c) =>
+            Math.abs(c - estHz) < Math.abs(best - estHz) ? c : best, 60);
+
+          updateTargetFromDisplay();
+        }
+      }
+      requestAnimationFrame(tick);
+    })();
+
+    function updateTargetFromDisplay(){
+      // Drop to 30 Hz on ~60 Hz displays; else use 40 Hz
+      targetHz = (approxHz === 60) ? 30 : 40;
+      useFrameToggle = (approxHz === 60 && targetHz === 30); // one toggle per frame @60Hz
+      toggleIntervalMs = 1000 / (2 * targetHz); // half-period
+      infoLine.textContent = `Display: ~${approxHz} Hz · Flicker: ${targetHz} Hz (${useFrameToggle ? 'frame-synced' : (toggleIntervalMs.toFixed(2)+' ms toggles')})`;
+    }
+
+    function updateCanvas() {
+      const mode = getSelectedMode();
+      let color;
+      if (mode === "clinical") {
+        color = state ? "#FFFFFF" : "#000000";
+      } else {
+        const b = Number(brightnessSlider.value) || 0;
+        color = state ? `rgb(${b},${b},${b})` : "#000000";
+      }
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function startFlicker() {
+      const duration = parseInt(durationInput.value, 10);
+      if (isNaN(duration) || duration < 1) return;
+
+      // Make sure we have a target determined (in case user starts very quickly)
+      updateTargetFromDisplay();
+
+      endTime = Date.now() + duration * 60000;
+      lastToggleTs = 0;
+      state = false; // start from black
+      updateCanvas();
+
+      cancelAnimationFrame(animationId);
+      animationId = requestAnimationFrame(flickerLoop);
+      updateTimer(); // start timer loop
+    }
+
+    function flickerLoop(now) {
+      // now is a high-res timestamp in ms from rAF
+      if (useFrameToggle) {
+        // 60 Hz → toggle every frame → exact 30 Hz
+        state = !state;
+        updateCanvas();
+      } else {
+        if (lastToggleTs === 0) lastToggleTs = now;
+        if ((now - lastToggleTs) >= toggleIntervalMs) {
+          state = !state;
+          updateCanvas();
+          lastToggleTs = now;
+        }
+      }
+
+      if (Date.now() < endTime) {
+        animationId = requestAnimationFrame(flickerLoop);
+      } else {
+        stopFlicker();
+      }
+    }
+
+    function stopFlicker() {
+      cancelAnimationFrame(animationId);
+      animationId = null;
+      // clear to black
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      timerDisplay.textContent = "Remaining: 00:00";
+    }
+
+    // Timer loop uses rAF for smooth countdown
+    let timerRAF = null;
+    function updateTimer() {
+      const remaining = Math.max(0, endTime - Date.now());
+      const mins = String(Math.floor(remaining / 60000)).padStart(2, '0');
+      const secs = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
+      timerDisplay.textContent = `Remaining: ${mins}:${secs}`;
+
+      if (remaining > 0 && animationId !== null) {
+        timerRAF = requestAnimationFrame(updateTimer);
+      } else {
+        cancelAnimationFrame(timerRAF);
+        timerRAF = null;
+      }
+    }
+
+    // Hook up buttons
+    startBtn.addEventListener('click', startFlicker);
+    stopBtn.addEventListener('click', stopFlicker);
+  </script>
+</body>
+</html>
