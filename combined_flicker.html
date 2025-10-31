@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Neuro Flicker — Stable 30/40 Hz + 1 Hz Gamma Bursts + Alternation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<style>
+  html,body{
+    margin:0;padding:0;background:#000;color:#fff;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;
+    overflow:hidden;
+  }
+  canvas{display:block}
+  #ui{
+    position:fixed;top:16px;left:16px;z-index:10;
+    background:rgba(0,0,0,.72);backdrop-filter:blur(2px);
+    padding:14px 16px;border-radius:12px;line-height:1.5;max-width:460px;
+    transition:opacity .4s ease, visibility .4s ease;
+  }
+  #ui.hidden{opacity:0;visibility:hidden;pointer-events:none;}
+  #ui label{display:block;margin:6px 0}
+  #ui input[type="number"]{width:90px}
+  button{cursor:pointer}
+  #t{margin-top:6px;font-weight:700}
+  #inf{margin-top:4px;font-size:13px;opacity:.9}
+  #panel{display:grid;grid-template-columns:1fr;gap:8px}
+  #burstControls,#altControls{
+    padding:8px;border-radius:8px;background:rgba(255,255,255,.06)
+  }
+  #brand{
+    position:fixed;right:10px;bottom:10px;z-index:9;
+    background:rgba(0,0,0,.5);padding:6px 10px;border-radius:8px;
+    font-size:12px;user-select:none
+  }
+</style>
+</head>
+<body>
+  <div id="ui">
+    <div id="panel">
+      <div>
+        <strong>Display Mode</strong>
+        <label><input type="radio" name="mode" value="clinical" checked> Clinical (black / white)</label>
+        <label><input type="radio" name="mode" value="safe"> Safe (dimmed)</label>
+        <label><input type="radio" name="mode" value="panel"> Panel-Safe (20% ↔ 80% with soft edges)</label>
+        <label>Brightness (Safe): <input id="b" type="range" min="0" max="255" value="136"></label>
+      </div>
+
+      <hr style="border:none;border-top:1px solid rgba(255,255,255,.15);margin:0">
+
+      <div>
+        <strong>Pattern</strong>
+        <label><input type="radio" name="pattern" value="continuous" checked> Continuous (auto 30 / 40 Hz)</label>
+        <label><input type="radio" name="pattern" value="bursts"> Gamma bursts @ 1 Hz</label>
+        <label><input type="radio" name="pattern" value="alternate"> Adaptive Alternation (continuous ↔ bursts)</label>
+
+        <div id="burstControls" style="display:none">
+          <label>Duty cycle (burst ON %): <input id="duty" type="range" min="10" max="90" value="50"> <span id="dutyVal">50%</span></label>
+        </div>
+
+        <div id="altControls" style="display:none">
+          <label>Alternation interval (s): <input id="altSec" type="number" min="15" max="180" step="5" value="60"></label>
+          <div style="font-size:12px;opacity:.85">Switches between steady gamma and 1 Hz gamma bursts every N seconds.</div>
+        </div>
+      </div>
+
+      <div>
+        <label>Duration (min): <input id="mins" type="number" min="1" max="30" value="4"></label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+          <button id="start">Start</button>
+          <button id="stop">Stop</button>
+          <button id="fs">Fullscreen</button>
+        </div>
+        <div id="t">Remaining: 00:00</div>
+        <div id="inf">Detecting refresh…</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="brand">Designed by Meaningful Path Therapy (Abdullah Al-Shoaibi)</div>
+  <canvas id="cv"></canvas>
+
+<script>
+/* ---------- Canvas setup ---------- */
+const cv=document.getElementById('cv');
+const ctx=cv.getContext('2d',{alpha:false});
+function fit(){cv.width=innerWidth;cv.height=innerHeight;}
+addEventListener('resize',fit,{passive:true});fit();
+
+/* UI elements */
+const ui=document.getElementById('ui');
+const bEl=document.getElementById('b');
+const mEl=document.getElementById('mins');
+const tEl=document.getElementById('t');
+const infEl=document.getElementById('inf');
+const startBtn=document.getElementById('start');
+const stopBtn=document.getElementById('stop');
+const fsBtn=document.getElementById('fs');
+const dutyEl=document.getElementById('duty');
+const dutyVal=document.getElementById('dutyVal');
+const burstControls=document.getElementById('burstControls');
+const altSecEl=document.getElementById('altSec');
+const altControls=document.getElementById('altControls');
+
+const mode=()=>document.querySelector('input[name="mode"]:checked').value;
+const pattern=()=>document.querySelector('input[name="pattern"]:checked').value;
+
+/* Hide/show sub-controls */
+function updateSubControls(){
+  const p=pattern();
+  burstControls.style.display=(p==='bursts'||p==='alternate')?'block':'none';
+  altControls.style.display=(p==='alternate')?'block':'none';
+  updateInf();
+}
+document.querySelectorAll('input[name="pattern"]').forEach(r=>r.addEventListener('change',updateSubControls));
+dutyEl.addEventListener('input',()=>{dutyVal.textContent=`${dutyEl.value}%`;updateInf();});
+altSecEl.addEventListener('input',()=>updateInf());
+
+/* ---------- State ---------- */
+let running=false,endAt=0,approxHz=60,targetHz=30;
+let paintState=false,lastFlipHr=performance.now();
+let sessionStartHr=0;
+let altPhase='continuous',altTimer=null;
+
+/* ---------- Palette / paint ---------- */
+const PANEL_ON=[204,204,204],PANEL_OFF=[51,51,51];
+const EDGE_MS=4;
+function mix(a,b,t){return`rgb(${a[0]+(b[0]-a[0])*t},${a[1]+(b[1]-a[1])*t},${a[2]+(b[2]-a[2])*t})`;}
+function rampColour(now){
+  const dt=Math.min(EDGE_MS,Math.max(0,now-lastFlipHr));
+  const frac=dt/EDGE_MS;const ease=0.5-0.5*Math.cos(Math.PI*frac);
+  return(paintState?mix(PANEL_OFF,PANEL_ON,ease):mix(PANEL_ON,PANEL_OFF,ease));
+}
+function fillInner(col){ctx.fillStyle='#000';ctx.fillRect(0,0,cv.width,cv.height);ctx.fillStyle=col;ctx.fillRect(1,1,cv.width-2,cv.height-2);}
+function paint(now=performance.now()){
+  const md=mode();
+  if(md==='clinical'){fillInner(paintState?'#fff':'#000');}
+  else if(md==='safe'){const v=+bEl.value||0;fillInner(paintState?`rgb(${v},${v},${v})`:'#000');}
+  else fillInner(rampColour(now));
+}
+
+/* ---------- Refresh detect ---------- */
+(function detect(){
+  const s=[];let last=performance.now();
+  function tick(now){s.push(now-last);last=now;
+    if(s.length<120){requestAnimationFrame(tick);}
+    else{
+      s.shift();const m=s.sort((a,b)=>a-b)[Math.floor(s.length/2)];
+      const est=1000/m;const cand=[50,60,75,90,100,120,144,165,180,200,240];
+      approxHz=cand.reduce((best,c)=>Math.abs(c-est)<Math.abs(best-est)?c:best,60);
+      targetHz=(approxHz===60)?30:40;updateInf();
+    }}
+  requestAnimationFrame(tick);
+})();
+
+/* ---------- Info text ---------- */
+function phaseLabel(){
+  if(pattern()==='alternate')return` · Phase: ${altPhase}`;
+  if(pattern()==='bursts')return' · Phase: bursts';
+  return' · Phase: continuous';
+}
+function updateInf(extra=''){
+  const p=pattern(),d=`${dutyEl.value}%`;
+  const pat=p==='bursts'?` · Pattern: 1 Hz bursts (${d})`:
+             p==='alternate'?` · Pattern: alternating (${altSecEl.value}s) · Duty ${d}`:
+             ' · Pattern: continuous';
+  infEl.textContent=`Display ≈ ${approxHz} Hz · Target ${targetHz} Hz · Engine: ${engine}${phaseLabel()}${pat}${extra}`;
+}
+
+/* ---------- Timing engines ---------- */
+let engine='idle',rafId=null,timerId=null;
+let audioCtx=null,worklet=null,watchdog=null,gotFirst=false;
+const workletCode=`class Tick extends AudioWorkletProcessor{constructor(){super();this.c=0;this.hp=800;this.port.onmessage=e=>{if(e.data.hp)this.hp=e.data.hp;}}process(i,o,p){const out=o[0];for(let c=0;c<out.length;c++)out[c].fill(0);this.c+=out[0].length;let t=0;while(this.c>=this.hp){this.c-=this.hp;t++;}if(t&1)this.port.postMessage(1);return true;}}registerProcessor('tick',Tick);`;
+async function startAudioEngine(freq){
+  try{
+    engine='starting';updateInf(' (starting)…');
+    audioCtx=new AudioContext({latencyHint:'interactive'});
+    const url=URL.createObjectURL(new Blob([workletCode],{type:'application/javascript'}));
+    await audioCtx.audioWorklet.addModule(url);URL.revokeObjectURL(url);
+    worklet=new AudioWorkletNode(audioCtx,'tick');worklet.connect(audioCtx.destination);
+    worklet.port.onmessage=()=>{gotFirst=true;onEngineTick();};
+    worklet.parameters?.get?.('hp')?.setValueAtTime(audioCtx.sampleRate/(2*freq),audioCtx.currentTime);
+    if(audioCtx.state==='suspended')await audioCtx.resume();
+    engine='audio';updateInf();gotFirst=false;
+    watchdog=setTimeout(()=>{if(!gotFirst){stopAudioEngine();startRafEngine(freq);}},300);
+  }catch(e){stopAudioEngine();startRafEngine(freq);}
+}
+function stopAudioEngine(){clearTimeout(watchdog);if(worklet){worklet.port.onmessage=null;worklet.disconnect();worklet=null;}}
+let halfPeriodMs=1000/60;
+function startRafEngine(freq){engine='raf';halfPeriodMs=1000/(2*freq);updateInf();let last=performance.now();
+  (function loop(now){if(!running||engine!=='raf'){rafId=null;return;}
+    let e=now-last;while(e>=halfPeriodMs){last+=halfPeriodMs;e-=halfPeriodMs;onEngineTick(last);}
+    rafId=requestAnimationFrame(loop);})(performance.now());
+}
+function stopRafEngine(){if(rafId)cancelAnimationFrame(rafId);rafId=null;}
+
+/* ---------- Burst + alternation ---------- */
+function isBurstOn(ts=performance.now()){
+  const p=pattern();
+  if(p==='continuous'||(p==='alternate'&&altPhase==='continuous'))return true;
+  const duty=(+dutyEl.value||50)/100;
+  const t=(ts-sessionStartHr)%1000;return t<duty*1000;
+}
+function onEngineTick(ts=performance.now()){
+  if(!running)return;
+  const open=isBurstOn(ts);
+  if(!open){if(paintState){paintState=false;paint(ts);}return;}
+  paintState=!paintState;paint(ts);
+}
+function startAlternationScheduler(){
+  clearInterval(altTimer);if(pattern()!=='alternate')return;
+  const iv=Math.max(15000,Math.min(180000,(+altSecEl.value||60)*1000));
+  altPhase='continuous';updateInf();
+  altTimer=setInterval(()=>{
+    if(!running)return;
+    altPhase=(altPhase==='continuous')?'bursts':'continuous';
+    updateInf();
+  },iv);
+}
+
+/* ---------- Session ---------- */
+function tickTimer(){
+  const r=Math.max(0,endAt-Date.now());
+  const mm=String(Math.floor(r/60000)).padStart(2,'0');
+  const ss=String(Math.floor((r%60000)/1000)).padStart(2,'0');
+  tEl.textContent=`Remaining: ${mm}:${ss}`;if(r===0)stopSession();
+}
+async function startSession(){
+  if(running)return;
+  running=true;paintState=false;paint();sessionStartHr=performance.now();
+  const freq=targetHz;const mins=Math.max(1,Math.min(30,+mEl.value||4));
+  endAt=Date.now()+mins*60000;
+  await startAudioEngine(freq);startAlternationScheduler();
+  tickTimer();timerId=setInterval(tickTimer,250);
+}
+function stopSession(){
+  if(!running)return;running=false;
+  clearInterval(timerId);clearInterval(altTimer);
+  stopRafEngine();stopAudioEngine();engine='idle';
+  ctx.fillStyle='rgb(96,96,96)';ctx.fillRect(0,0,cv.width,cv.height);
+  tEl.textContent='Remaining: 00:00';updateInf();
+}
+
+/* ---------- Fullscreen hide/show UI ---------- */
+fsBtn.addEventListener('click',async()=>{
+  try{
+    if(!document.fullscreenElement){
+      await document.documentElement.requestFullscreen({navigationUI:'hide'});
+    }else{await document.exitFullscreen();}
+  }catch(e){}
+});
+document.addEventListener('fullscreenchange',()=>{
+  if(document.fullscreenElement)ui.classList.add('hidden');
+  else ui.classList.remove('hidden');
+});
+
+/* ---------- Safety ---------- */
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&running)stopSession();});
+startBtn.addEventListener('click',startSession);
+stopBtn.addEventListener('click',stopSession);
+
+/* Init */
+updateSubControls();
+</script>
+</body>
+</html>
