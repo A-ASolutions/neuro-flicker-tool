@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Neuro Flicker — Stable (Audio Clock) + Refresh Readout</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<style>
+  html,body{margin:0;padding:0;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;overflow:hidden}
+  canvas{display:block}
+  #ui{
+    position:fixed;top:12px;left:12px;z-index:10;
+    background:rgba(0,0,0,.72);backdrop-filter:blur(2px);
+    padding:12px 14px;border-radius:12px;line-height:1.4;max-width:520px
+  }
+  #ui label{display:block;margin:6px 0}
+  #row{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+  button,select{cursor:pointer}
+  #t{margin-top:6px;font-weight:700}
+  #inf{margin-top:4px;font-size:13px;opacity:.95;white-space:pre-wrap}
+  @media (max-width:640px){#ui{max-width:92vw;width:92vw;max-height:64vh;overflow:auto}}
+  #brand{position:fixed;right:10px;bottom:10px;z-index:9;background:rgba(0,0,0,.5);padding:6px 10px;border-radius:8px;font-size:12px;user-select:none}
+</style>
+</head>
+<body>
+  <div id="ui">
+    <strong>Neuro Flicker</strong>
+
+    <label>
+      Display Mode:
+      <select id="mode">
+        <option value="clinical" selected>Clinical (black/white)</option>
+        <option value="safe">Safe (dimmed)</option>
+      </select>
+    </label>
+
+    <label id="safeWrap" style="display:none">
+      Brightness (Safe): <input id="b" type="range" min="0" max="255" value="136">
+    </label>
+
+    <label>
+      Target Gamma (Hz):
+      <select id="gamma">
+        <option value="30">30</option>
+        <option value="36">36</option>
+        <option value="40" selected>40</option>
+        <option value="45">45</option>
+        <option value="48">48</option>
+      </select>
+    </label>
+
+    <label>
+      Pattern:
+      <select id="pattern">
+        <option value="continuous" selected>Continuous</option>
+        <option value="bursts">1 Hz gamma bursts (50% duty)</option>
+      </select>
+    </label>
+
+    <label>
+      Stability mode: <input id="useAudioClock" type="checkbox" checked> Audio clock (muted, sample-accurate)
+    </label>
+
+    <label>
+      Duration (min): <input id="mins" type="number" min="1" max="30" value="4" style="width:90px">
+    </label>
+
+    <div id="row">
+      <button id="start">Start</button>
+      <button id="stop">Stop</button>
+      <button id="fs">Fullscreen</button>
+    </div>
+
+    <div id="t">Remaining: 00:00</div>
+    <div id="inf">Idle.</div>
+  </div>
+
+  <div id="brand">Designed by Meaningful Path Therapy (Abdullah Al-Shoaibi)</div>
+  <canvas id="cv"></canvas>
+
+<script>
+/* ---------- Canvas ---------- */
+const cv=document.getElementById('cv');
+const ctx=cv.getContext('2d',{alpha:false});
+function fit(){cv.width=innerWidth;cv.height=innerHeight;}
+addEventListener('resize',fit,{passive:true});fit();
+
+/* ---------- UI ---------- */
+const modeEl=document.getElementById('mode');
+const safeWrap=document.getElementById('safeWrap');
+const bEl=document.getElementById('b');
+const gammaEl=document.getElementById('gamma');
+const patternEl=document.getElementById('pattern');
+const minsEl=document.getElementById('mins');
+const startBtn=document.getElementById('start');
+const stopBtn=document.getElementById('stop');
+const fsBtn=document.getElementById('fs');
+const tEl=document.getElementById('t');
+const infEl=document.getElementById('inf');
+const useAudioClockEl=document.getElementById('useAudioClock');
+
+modeEl.addEventListener('change',()=>{ safeWrap.style.display = modeEl.value==='safe' ? 'block' : 'none'; });
+
+/* ---------- State ---------- */
+let running=false, endAt=0;
+let targetHz=40;
+let halfPeriodMs = 1000/(2*targetHz);
+let rafId=null, timerId=null;
+let paintState=false;
+let lastFlipT=performance.now();
+let sessionStartT=0;
+let flipTimes=[]; // last 2 s for measured Hz
+let detectedRefreshHz = null;
+
+function setTarget(hz){ targetHz = Math.max(1, +hz||40); halfPeriodMs = 1000/(2*targetHz); }
+gammaEl.addEventListener('change',()=>{ setTarget(gammaEl.value); if(audioEngineActive) setWorkletHalfPeriod(); });
+
+/* ---------- Paint ---------- */
+function fillInner(col){ctx.fillStyle='#000';ctx.fillRect(0,0,cv.width,cv.height);ctx.fillStyle=col;ctx.fillRect(1,1,cv.width-2,cv.height-2);}
+function paint(now=performance.now()){
+  if(modeEl.value==='clinical'){
+    fillInner(paintState?'#fff':'#000');
+  }else{
+    const v=+bEl.value||0;
+    fillInner(paintState?`rgb(${v},${v},${v})`:'#000');
+  }
+}
+
+/* ---------- Burst gate ---------- */
+function burstOpen(now){
+  if(patternEl.value!=='bursts') return true;
+  const t = (now - sessionStartT) % 1000; // 1 Hz
+  return t < 500;
+}
+
+/* ---------- Live verifier ---------- */
+function updateVerifier(now){
+  const cutoff = now - 2000;
+  while(flipTimes.length && flipTimes[0] < cutoff) flipTimes.shift();
+  const flipsLast1s = flipTimes.filter(t => t >= now-1000).length;
+  const measuredHz = (flipsLast1s/2).toFixed(1);
+  const remaining = Math.max(0, endAt - Date.now());
+  const mm=String(Math.floor(remaining/60000)).padStart(2,'0');
+  const ss=String(Math.floor((remaining%60000)/1000)).padStart(2,'0');
+  const det = detectedRefreshHz ? ` · Detected refresh ≈ ${detectedRefreshHz} Hz` : '';
+  tEl.textContent = `Remaining: ${mm}:${ss}`;
+  infEl.textContent = `Target: ${targetHz.toFixed(1)} Hz · Measured: ${measuredHz} Hz · Engine: ${audioEngineActive?'audio':'phase'}${patternEl.value==='bursts'?' · bursts@1Hz':''}${det}`;
+}
+
+/* ---------- rAF-only refresh measurement (readout only) ---------- */
+async function measureRefresh(durationMs=900){
+  const d=[]; let last=performance.now(); const t0=last;
+  await new Promise(res=>{
+    function step(now){ d.push(now-last); last=now; if(now-t0<durationMs){ requestAnimationFrame(step); } else res(); }
+    requestAnimationFrame(step);
+    setTimeout(res, durationMs+120);
+  });
+  if(d.length<8){ detectedRefreshHz = null; return; }
+  d.sort((a,b)=>a-b);
+  const trim=Math.floor(d.length*0.1);
+  const core=d.slice(trim, d.length-trim);
+  const median=core[Math.floor(core.length/2)];
+  const est=1000/median;
+  // Tight bands
+  if(est>136 && est<152) detectedRefreshHz = 144;
+  else if(est>108 && est<132) detectedRefreshHz = 120;
+  else if(est>84  && est<96 ) detectedRefreshHz = 90;
+  else if(est>54  && est<66 ) detectedRefreshHz = 60;
+  else {
+    const cand=[50,60,75,90,100,120,144];
+    detectedRefreshHz = cand.reduce((b,c)=>Math.abs(c-est)<Math.abs(b-est)?c:b,60);
+  }
+}
+
+/* ---------- Engine A: Phase accumulator ---------- */
+function vsyncLoop(now){
+  if(!running || audioEngineActive){ rafId=null; return; }
+  if(burstOpen(now)){
+    while(now - lastFlipT >= halfPeriodMs){
+      lastFlipT += halfPeriodMs;
+      paintState = !paintState;
+      flipTimes.push(lastFlipT);
+      paint(lastFlipT);
+    }
+  }else{
+    if(paintState){ paintState=false; lastFlipT = now; flipTimes.push(now); paint(now); }
+  }
+  updateVerifier(now);
+  rafId=requestAnimationFrame(vsyncLoop);
+}
+
+/* ---------- Engine B: AudioWorklet clock ---------- */
+let audioCtx=null, worklet=null, gain=null, audioEngineActive=false;
+var workletCode =
+'class Tick extends AudioWorkletProcessor{' +
+'  constructor(){' +
+'    super();' +
+'    this.samplesPerHalf = 48000/(2*40);' + // default 40 Hz at 48k
+'    this.acc = 0;' +
+'    this.port.onmessage = (e)=>{' +
+'      if(e.data && e.data.hp){ this.samplesPerHalf = e.data.hp; }' +
+'    };' +
+'  }' +
+'  process(inputs, outputs, parameters){' +
+'    const out = outputs[0][0];' +
+'    const N = out.length;' +
+'    for(let i=0;i<N;i++){' +
+'      this.acc++;' +
+'      if(this.acc >= this.samplesPerHalf){' +
+'        this.acc -= this.samplesPerHalf;' +
+'        this.port.postMessage(1);' +
+'      }' +
+'      out[i] = 0;' + // muted
+'    }' +
+'    return true;' +
+'  }' +
+'}' +
+';registerProcessor("tick", Tick);';
+
+async function startAudioEngine(){
+  try{
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+    const blob = new Blob([workletCode], {type:'application/javascript'});
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    worklet = new AudioWorkletNode(audioCtx, 'tick', {outputChannelCount:[1]});
+    gain = audioCtx.createGain(); gain.gain.value = 0; // muted
+    worklet.connect(gain).connect(audioCtx.destination);
+    worklet.port.onmessage = onAudioTick;
+    setWorkletHalfPeriod();
+    if(audioCtx.state==='suspended'){ await audioCtx.resume(); }
+    audioEngineActive = true;
+  }catch(e){
+    stopAudioEngine();
+    audioEngineActive = false;
+  }
+}
+function setWorkletHalfPeriod(){
+  if(!audioCtx || !worklet) return;
+  const hp = audioCtx.sampleRate/(2*targetHz);
+  worklet.port.postMessage({hp: hp});
+}
+function stopAudioEngine(){
+  try{ worklet && worklet.disconnect(); }catch(e){}
+  try{ gain && gain.disconnect(); }catch(e){}
+  try{ audioCtx && audioCtx.close(); }catch(e){}
+  worklet=null; gain=null; audioCtx=null; audioEngineActive=false;
+}
+function onAudioTick(){
+  if(!running) return;
+  const now = performance.now();
+  if(burstOpen(now)){
+    paintState = !paintState;
+    lastFlipT = now;
+    flipTimes.push(now);
+    paint(now);
+  }else{
+    if(paintState){ paintState=false; lastFlipT = now; flipTimes.push(now); paint(now); }
+  }
+}
+
+/* ---------- Session ---------- */
+async function startSession(){
+  if(running) return;
+  running=true;
+  setTarget(gammaEl.value);
+  paintState=false; paint();
+  sessionStartT = performance.now();
+  lastFlipT = sessionStartT;
+  flipTimes.length = 0;
+
+  // measure display refresh (readout only)
+  detectedRefreshHz = null;
+  measureRefresh().then(()=>{ /* readout appears in the info line */ });
+
+  const mins=Math.max(1,Math.min(30,+minsEl.value||4));
+  endAt=Date.now()+mins*60000;
+
+  if(useAudioClockEl.checked){
+    await startAudioEngine(); // falls back automatically on failure
+  }else{
+    audioEngineActive=false;
+  }
+
+  const loop=(t)=>{
+    if(!running){ rafId=null; return; }
+    if(!audioEngineActive) vsyncLoop(t); else { updateVerifier(t); rafId=requestAnimationFrame(loop); }
+  };
+  rafId=requestAnimationFrame(loop);
+
+  timerId=setInterval(()=>{ if(Date.now()>=endAt) stopSession(); }, 250);
+  infEl.textContent = 'Starting…';
+}
+function stopSession(){
+  if(!running) return;
+  running=false;
+  if(rafId) cancelAnimationFrame(rafId); rafId=null;
+  clearInterval(timerId);
+  stopAudioEngine();
+  ctx.fillStyle='rgb(96,96,96)'; ctx.fillRect(0,0,cv.width,cv.height);
+  tEl.textContent='Remaining: 00:00';
+  infEl.textContent='Stopped.';
+}
+
+/* ---------- Fullscreen & safety ---------- */
+fsBtn.addEventListener('click',async()=>{
+  try{
+    if(!document.fullscreenElement){
+      await document.documentElement.requestFullscreen({navigationUI:'hide'});
+      document.getElementById('ui').classList.add('hidden');
+    }else{
+      await document.exitFullscreen();
+      document.getElementById('ui').classList.remove('hidden');
+    }
+  }catch(e){}
+});
+document.addEventListener('visibilitychange',()=>{ if(document.hidden&&running) stopSession(); });
+
+/* ---------- Events ---------- */
+startBtn.addEventListener('click', startSession);
+stopBtn.addEventListener('click', stopSession);
+
+/* ---------- Init ---------- */
+infEl.textContent='Idle. Pick a frequency and press Start. “Measured” should match Target within ±0.2 Hz. A refresh readout appears after start.';
+</script>
+</body>
+</html>
